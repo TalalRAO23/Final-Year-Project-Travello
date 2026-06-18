@@ -1,0 +1,142 @@
+
+services:
+
+  
+  #  PostgreSQL 16  — primary datastore
+
+  db:
+    image: postgres:16-alpine
+    container_name: travello-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       travello_db
+      POSTGRES_USER:     travello
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-travello_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U travello -d travello_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    
+  #  Redis 7  — caching layer (scraper results, sessions)
+  
+  redis:
+    image: redis:7-alpine
+    container_name: travello-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+        --maxmemory 128mb
+        --maxmemory-policy allkeys-lru
+        --save 60 1000
+        --loglevel warning
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  #  Django Backend  — REST API + Puppeteer scraper
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: travello-backend
+    restart: unless-stopped
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      # Docker-internal overrides (take precedence over .env)
+      DATABASE_URL:          postgres://travello:${DB_PASSWORD:-travello_secret}@db:5432/travello_db
+      REDIS_URL:             redis://redis:6379/0
+      DEBUG:                 ${DEBUG:-True}
+      ALLOWED_HOSTS:         localhost,127.0.0.1,backend,0.0.0.0,${EXTRA_HOSTS:-}
+      CORS_ALLOW_ALL_ORIGINS: "True"
+    volumes:
+      - backend_data:/app/data
+      - backend_media:/app/media
+      - backend_static:/app/staticfiles
+    ports:
+      - "8000:8000" 
+    networks:
+      - backend-net
+      - frontend-net
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  
+  #  React Frontend  — production SPA served by nginx
+  
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL:      ${REACT_APP_API_URL:-http://localhost:8000}
+        REACT_APP_API_BASE_URL: ${REACT_APP_API_URL:-http://localhost:8000}
+    container_name: travello-frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"                        # Host 3000 → Container nginx 80
+    networks:
+      - frontend-net                     # Can reach backend, NOT db/redis
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:80/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+
+#  Named Volumes — persistent data across restarts
+
+volumes:
+  postgres_data:
+    driver: local
+    name: travello-pgdata
+  redis_data:
+    driver: local
+    name: travello-redis
+  backend_data:
+    driver: local
+    name: travello-data
+  backend_media:
+    driver: local
+    name: travello-media
+  backend_static:
+    driver: local
+    name: travello-static
+
+
+#  Docker Networks — service isolation
+
+networks:
+  backend-net:
+    driver: bridge
+    name: travello-backend-net
+  frontend-net:
+    driver: bridge
+    name: travello-frontend-net
